@@ -2,6 +2,8 @@
 
 Supplementary material for Section X of *Where is the mind? Persona vectors and LLM individuation* (Beckmann & Butlin, 2026).
 
+This repository contains everything needed to replicate the experiment (`run_experiment.py`, `plot_results.py`), pre-computed results for all 520 generations (`results/`), and a detailed probe-by-probe analysis with qualitative examples below.
+
 ---
 
 ## Overview
