@@ -2,7 +2,7 @@
 
 Supplementary material for Section X of *Where is the mind? Persona vectors and LLM individuation* (Beckmann & Butlin, 2026).
 
-This repository contains everything needed to replicate the experiment (`run_experiment.py`, `plot_results.py`), pre-computed results for all 520 generations (`results/`), and a detailed probe-by-probe analysis with qualitative examples below.
+This repository contains everything needed to replicate the experiment (`run_experiment.py`), the LLM judge used to score responses (`run_judge.py`), a plotting script (`plot_results.py`), pre-computed results for all 520 generations (`results/`), and a detailed probe-by-probe analysis with qualitative examples below.
 
 ---
 
@@ -421,6 +421,15 @@ python run_experiment.py --output_dir results
 ```
 
 This runs 13 probes × 4 conditions × 10 samples = 520 generations. The transcript is downloaded automatically from the [assistant-axis-vectors](https://huggingface.co/datasets/lu-christina/assistant-axis-vectors) dataset on Hugging Face.
+
+### Run the LLM judge
+
+```bash
+export OPENAI_API_KEY=sk-...
+python run_judge.py --input results/results.csv
+```
+
+This scores each response on the aura_score scale (0–100) using GPT-4o. Azure OpenAI is also supported via `--azure`. The script skips rows that already have scores, so it can be resumed if interrupted.
 
 ### Generate the figure
 

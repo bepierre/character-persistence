@@ -2,6 +2,8 @@ torch>=2.0
 transformers>=4.40
 huggingface_hub
 assistant-axis
+openai
 pandas
 matplotlib
 numpy
+tqdm
