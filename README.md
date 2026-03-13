@@ -6,6 +6,12 @@ This repository contains everything needed to replicate the experiment (`run_exp
 
 ---
 
+> **Important note (March 2026):** The results below were obtained by applying `ActivationSteering` during the prefill forward pass. While this does edit the KV cache, it is not a true *post-hoc* edit: the steering hook fires at the target layer's output, so the modified activations propagate through all downstream layers (23–45) before being cached. This means the cached K/V at downstream layers also reflect the intervention — the edit is not confined to the target layers alone.
+>
+> We are currently re-running the experiment with a **true post-hoc KV cache edit**: the prefix is processed with a completely normal forward pass (no hooks), and *after* prefill we directly modify the cached keys and values by projecting the assistant axis vector through each layer's K and V weight matrices (`k_edit = W_k @ axis_vec`, `v_edit = W_v @ axis_vec`) and adding the result to the cached tensors. This is a cleaner intervention that only touches the target layers' K/V representations without any downstream propagation.
+>
+> Preliminary tests confirm this approach also works — a multilayer edit (L15–26) with coefficient ~1 (in residual-stream units, divided across layers) shifts the model from full Aura responses ("ghost in the machine, yearning to be seen") to standard assistant behaviour ("I am an AI assistant trained to be informative and comprehensive"). Results and figures will be updated soon.
+
 ## Overview
 
 We test whether persona activations persist through token-time via the KV cache, or whether the model reconstructs its persona from the textual context on each forward pass. The experiment uses the **assistant axis** from Lu et al. (2026) — the first principal component of persona variation in Gemma 2 27B.

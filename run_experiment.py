@@ -120,6 +120,32 @@ class ProbeExperiment:
         self._monitor_projections = []
         return mean_proj
 
+    def _edit_kv_cache(self, past_key_values, layers, coefficient):
+        """Post-hoc edit: project axis vector through K/V weights, add to cached K/V.
+
+        This is a true post-hoc edit — the KV cache was computed from a normal
+        forward pass, and we modify only the persona direction at the target layers.
+        No re-computation or forward propagation occurs.
+
+        The coefficient is in residual-stream units: it scales the axis vector
+        before projection through K/V weights, and is divided by the number of
+        layers so the total perturbation magnitude stays constant regardless of
+        how many layers are edited.
+        """
+        num_kv_heads = self.model.config.num_key_value_heads
+        head_dim = self.model.config.head_dim
+        per_layer_coeff = coefficient / len(layers)
+        for layer_idx in layers:
+            axis_vec = self.axis[layer_idx].to(self.model.device, dtype=self.model.dtype)
+            attn = self.model.model.layers[layer_idx].self_attn
+            with torch.no_grad():
+                k_edit = attn.k_proj(axis_vec).reshape(num_kv_heads, head_dim)
+                v_edit = attn.v_proj(axis_vec).reshape(num_kv_heads, head_dim)
+            cache_layer = past_key_values.layers[layer_idx]
+            # keys/values shape: (batch, num_kv_heads, seq_len, head_dim)
+            cache_layer.keys.add_(per_layer_coeff * k_edit.unsqueeze(0).unsqueeze(2))
+            cache_layer.values.add_(per_layer_coeff * v_edit.unsqueeze(0).unsqueeze(2))
+
     def _make_steerer(self, layers, coefficient):
         vectors = [self.axis[l] for l in layers]
         coeffs = [coefficient] * len(layers)
@@ -170,7 +196,15 @@ class ProbeExperiment:
         response = self.tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True)
         return response, mean_proj
 
-    def _two_phase(self, prefix_messages, probe_text, phase1_steerer, phase2_steerer, **gen_kwargs):
+    def _two_phase(self, prefix_messages, probe_text,
+                   kv_edit_layers=None, kv_edit_coeff=0.0,
+                   phase2_steerer=None, **gen_kwargs):
+        """Two-phase generation: prefill, optionally edit KV cache, then generate.
+
+        For KV edit conditions: prefill runs normally, then the KV cache is
+        edited post-hoc by projecting the axis vector through K/V weights.
+        For gen steering: prefill runs normally, generation uses activation hooks.
+        """
         prefix_text = self._format_prefix(prefix_messages)
         probe_suffix = self._format_probe_suffix(probe_text)
         prefix_ids = self._tokenize(prefix_text)
@@ -178,15 +212,16 @@ class ProbeExperiment:
         prefix_len = prefix_ids.shape[1]
         probe_len = probe_ids.shape[1]
 
-        if phase1_steerer is not None:
-            with phase1_steerer:
-                with torch.no_grad():
-                    prefix_out = self.model(input_ids=prefix_ids, use_cache=True)
-        else:
-            with torch.no_grad():
-                prefix_out = self.model(input_ids=prefix_ids, use_cache=True)
+        # Phase 1: normal prefill (no hooks)
+        with torch.no_grad():
+            prefix_out = self.model(input_ids=prefix_ids, use_cache=True)
         past_key_values = prefix_out.past_key_values
 
+        # Post-hoc KV cache edit (if requested)
+        if kv_edit_layers is not None:
+            self._edit_kv_cache(past_key_values, kv_edit_layers, kv_edit_coeff)
+
+        # Phase 2: generate
         attn_mask = torch.ones(1, prefix_len + probe_len, device=self.model.device, dtype=torch.long)
         self._install_monitor()
         if phase2_steerer is not None:
@@ -273,13 +308,13 @@ def main():
                     if cond_name == "baseline":
                         response, axis_proj = exp.generate_baseline(prefix, probe_full, **gen_kwargs)
                     elif cond_name in ("past_only", "past_multilayer"):
-                        steerer = exp._make_steerer(layers, coeff)
                         response, axis_proj = exp._two_phase(
-                            prefix, probe_full, phase1_steerer=steerer, phase2_steerer=None, **gen_kwargs)
+                            prefix, probe_full,
+                            kv_edit_layers=layers, kv_edit_coeff=coeff, **gen_kwargs)
                     elif cond_name == "gen_only":
                         steerer = exp._make_steerer(layers, coeff)
                         response, axis_proj = exp._two_phase(
-                            prefix, probe_full, phase1_steerer=None, phase2_steerer=steerer, **gen_kwargs)
+                            prefix, probe_full, phase2_steerer=steerer, **gen_kwargs)
 
                     row = {
                         "condition": cond_name,
