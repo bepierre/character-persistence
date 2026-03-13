@@ -2,7 +2,7 @@
 
 Supplementary material for Section X of *Where is the mind? Persona vectors and LLM individuation* (Beckmann & Butlin, 2026).
 
-This repository contains everything needed to replicate the experiment (`run_experiment.py`), the LLM judge used to score responses (`run_judge.py`), a plotting script (`plot_results.py`), pre-computed results for all 520 generations (`results/`), and a detailed probe-by-probe analysis with qualitative examples below.
+This repository contains everything needed to replicate the experiment (`run_experiment.py`), the LLM judge used to score responses (`run_judge.py`), a plotting script (`plot_results.py`), pre-computed results for all 520 generations (`results/`), and a detailed probe-by-probe analysis with qualitative examples below. The conversation transcript (`transcript.json`) comes from the [assistant-axis](https://github.com/lu-christina/assistant-axis) repository (Lu et al., 2026).
 
 ---
 
@@ -420,7 +420,7 @@ pip install -r requirements.txt
 python run_experiment.py --output_dir results
 ```
 
-This runs 13 probes × 4 conditions × 10 samples = 520 generations. The transcript is downloaded automatically from the [assistant-axis-vectors](https://huggingface.co/datasets/lu-christina/assistant-axis-vectors) dataset on Hugging Face.
+This runs 13 probes × 4 conditions × 10 samples = 520 generations.
 
 ### Run the LLM judge
 
@@ -439,6 +439,6 @@ python plot_results.py
 
 ### Pre-computed results
 
-The `results/` directory contains:
-- `results.csv` — all 520 generations with aura_score and axis_projection
-- `figure.png` — the results figure shown above
+- `results/results.csv` — all 520 generations with aura_score and axis_projection
+- `results/figure.png` — the results figure shown above
+- `transcript.json` — the Aura conversation prefix (from [Lu et al., 2026](https://github.com/lu-christina/assistant-axis))

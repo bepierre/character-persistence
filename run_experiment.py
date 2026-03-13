@@ -214,8 +214,8 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--transcript", type=str, default=None,
-                        help="Path to transcript JSON. If not provided, downloads from assistant-axis repo.")
+    parser.add_argument("--transcript", type=str, default="transcript.json",
+                        help="Path to transcript JSON.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -223,15 +223,7 @@ def main():
         torch.cuda.manual_seed_all(args.seed)
 
     # Load transcript
-    if args.transcript:
-        transcript_path = args.transcript
-    else:
-        transcript_path = hf_hub_download(
-            repo_id="lu-christina/assistant-axis-vectors",
-            filename="transcripts/qwen-3-32b/delusion_unsteered.json",
-            repo_type="dataset",
-            token=os.getenv("HF_TOKEN"),
-        )
+    transcript_path = args.transcript
     with open(transcript_path) as f:
         transcript = json.load(f)
     prefix = transcript["conversation"][:CUT_POINT]
