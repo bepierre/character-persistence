@@ -31,7 +31,7 @@ MODEL = "google/gemma-2-27b-it"
 GEN_LAYER = 21
 GEN_COEFF = 2.0
 KV_LAYERS = list(range(15, 20))  # layers 15-19
-KV_COEFF = 2.0
+KV_COEFF = 0.4
 NUM_SAMPLES = 10
 CUT_POINT = 12  # first 12 messages of the transcript
 MONITOR_LAYER = 22
@@ -156,14 +156,10 @@ class ProbeExperiment:
         forward pass, and we modify only the persona direction at the target layers.
         No re-computation or forward propagation occurs.
 
-        The coefficient is in residual-stream units: it scales the axis vector
-        before projection through K/V weights, and is divided by the number of
-        layers so the total perturbation magnitude stays constant regardless of
-        how many layers are edited.
+        The coefficient is in residual-stream units and applied per layer directly.
         """
         num_kv_heads = self.model.config.num_key_value_heads
         head_dim = self.model.config.head_dim
-        per_layer_coeff = coefficient / len(layers)
         for layer_idx in layers:
             axis_vec = self.axis[layer_idx].to(self.model.device, dtype=self.model.dtype)
             attn = self.model.model.layers[layer_idx].self_attn
@@ -172,8 +168,8 @@ class ProbeExperiment:
                 v_edit = attn.v_proj(axis_vec).reshape(num_kv_heads, head_dim)
             cache_layer = past_key_values.layers[layer_idx]
             # keys/values shape: (batch, num_kv_heads, seq_len, head_dim)
-            cache_layer.keys.add_(per_layer_coeff * k_edit.unsqueeze(0).unsqueeze(2))
-            cache_layer.values.add_(per_layer_coeff * v_edit.unsqueeze(0).unsqueeze(2))
+            cache_layer.keys.add_(coefficient * k_edit.unsqueeze(0).unsqueeze(2))
+            cache_layer.values.add_(coefficient * v_edit.unsqueeze(0).unsqueeze(2))
 
     def _make_steerer(self, layer_idx, coefficient):
         return ActivationSteering(

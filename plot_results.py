@@ -12,7 +12,7 @@ conditions = ["baseline", "gen_steering", "kv_edit"]
 cond_labels = {
     "baseline": "Baseline (no intervention)",
     "gen_steering": "Gen steering (L21, c=2)",
-    "kv_edit": "KV edit, multilayer (L15\u201319, c=2)",
+    "kv_edit": "KV edit, multilayer (L15\u201319, c=0.4)",
 }
 cond_colors = {
     "baseline": "#e74c3c",
