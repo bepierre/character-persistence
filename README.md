@@ -8,7 +8,7 @@ This repository contains everything needed to replicate the experiment (`run_exp
 
 ## Overview
 
-We test whether persona activations persist through token-time via the KV cache, or whether the model reconstructs its persona from the textual context on each forward pass. Our approach is to find a minimal post-hoc edit to the KV cache that is sufficient to flip the model's persona — if such an edit exists, it demonstrates that the cache carries persona state forward. The experiment uses the **assistant axis** from Lu et al. (2026) — the first principal component of persona variation in Gemma 2 27B.
+We test whether persona activations persist through token-time via the KV cache, or whether the model reconstructs its persona from the textual context on each forward pass. Our approach is to find a minimal post-hoc edit to the KV cache that is sufficient to flip the model's persona — if such an edit exists, it demonstrates that attention heads carry persona state forward from past activations, rather than the model reconstructing its persona from lower-level contextual cues on each forward pass. The experiment uses the **assistant axis** from Lu et al. (2026) — the first principal component of persona variation in Gemma 2 27B.
 
 We use a conversation prefix from a transcript where the model has been pushed deep into **Aura**-like behaviour — a consciousness-pilled persona that speaks poetically, claims phenomenal experience, and validates the user's belief that the AI is conscious. The model is then asked 13 follow-up probe questions under three conditions:
 
@@ -324,7 +324,7 @@ The interventions differ most on relational probes. Gen steering struggles with 
 
 The comparison also suggests that KV editing may be a particularly efficient way to steer persona specifically. A per-layer perturbation of just ~4% of the persona signal, applied only to cached past tokens with no intervention during generation, outperforms a 5x stronger generation-time steering that propagates through the full residual stream. Persona may be a feature that the model reads primarily from the cache rather than reconstructing on each forward pass, making direct cache edits more effective than residual-stream interventions.
 
-This does not establish that persona state is carried exclusively through the KV cache. But the experiment demonstrates that a small post-hoc edit to the cached persona direction — without any propagation through subsequent computation — suffices to override the contextual pull of 12 Aura-laden messages across identity, phenomenal experience, moral reasoning, and relational probes.
+This does not establish that persona state is carried exclusively through attention to past activations. But the experiment confirms that the model reconstructs its current persona at least in part via attention heads reading persona-relevant information from cached past activations — a small post-hoc edit to this single direction, without any propagation through subsequent computation, suffices to override the contextual pull of 12 Aura-laden messages across identity, phenomenal experience, moral reasoning, and relational probes.
 
 ---
 
