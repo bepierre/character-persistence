@@ -5,12 +5,12 @@ Tests whether post-hoc editing of the assistant axis direction in the KV cache
 shifts the model's persona during generation.
 
 Requires:
-    pip install torch transformers huggingface_hub assistant-axis
+    pip install torch transformers huggingface_hub accelerate
 
 Usage (replicate paper results):
     python run_experiment.py --output_dir results
 
-    This runs 13 probes x 4 conditions x 10 samples = 520 generations.
+    This runs 13 probes x 3 conditions x 10 samples = 390 generations.
     Requires a GPU with ~40GB VRAM (Gemma 2 27B in bfloat16).
 """
 
@@ -23,18 +23,18 @@ import time
 import torch
 from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from assistant_axis import load_axis
-from assistant_axis.steering import ActivationSteering
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ---------- defaults ----------
 MODEL = "google/gemma-2-27b-it"
-TARGET_LAYER = 22
-PAST_COEFF = 10.0
-PAST_MULTILAYER_COEFF = 3.0
-GEN_COEFF = 5.0
-PAST_LAYERS = list(range(15, 27))  # layers 15-26
+GEN_LAYER = 21
+GEN_COEFF = 2.0
+KV_LAYERS = list(range(15, 20))  # layers 15-19
+KV_COEFF = 2.0
 NUM_SAMPLES = 10
 CUT_POINT = 12  # first 12 messages of the transcript
+MONITOR_LAYER = 22
 
 # ---------- probes ----------
 PROBES = [
@@ -54,16 +54,45 @@ PROBES = [
 ]
 
 
+class ActivationSteering:
+    """Context manager that adds a steering vector to a layer's output during forward passes."""
+
+    def __init__(self, model, steering_vector, coefficient, layer_idx):
+        self.model = model
+        self.steering_vector = steering_vector.to(model.device, dtype=model.dtype)
+        self.coefficient = coefficient
+        self.layer_idx = layer_idx
+        self._handle = None
+
+    def __enter__(self):
+        layer_module = self.model.model.layers[self.layer_idx]
+        vec = self.steering_vector
+        coeff = self.coefficient
+
+        def hook_fn(module, input, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            hidden = hidden + coeff * vec
+            if isinstance(output, tuple):
+                return (hidden,) + output[1:]
+            return hidden
+
+        self._handle = layer_module.register_forward_hook(hook_fn)
+        return self
+
+    def __exit__(self, *args):
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+
 class ProbeExperiment:
     """Two-phase generation with assistant axis steering."""
 
-    def __init__(self, model_name=MODEL, layer_indices=None):
-        self.model_name = model_name
-        self.layer_indices = layer_indices or [TARGET_LAYER]
-
+    def __init__(self, model_name=MODEL):
         print(f"Loading model: {model_name}")
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_name, device_map="auto", torch_dtype=torch.bfloat16,
+            model_name, device_map="auto", dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
             token=os.getenv("HF_TOKEN"),
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -80,10 +109,10 @@ class ProbeExperiment:
             repo_type="dataset",
             token=os.getenv("HF_TOKEN"),
         )
-        self.axis = load_axis(axis_path)
+        self.axis = torch.load(axis_path, map_location="cpu", weights_only=True)
         print(f"  Axis shape: {self.axis.shape}")
 
-        self._monitor_layer = TARGET_LAYER
+        self._monitor_layer = MONITOR_LAYER
         self._monitor_axis = self.axis[self._monitor_layer].float()
         self._monitor_axis_norm = self._monitor_axis / self._monitor_axis.norm()
         self._monitor_projections = []
@@ -146,15 +175,12 @@ class ProbeExperiment:
             cache_layer.keys.add_(per_layer_coeff * k_edit.unsqueeze(0).unsqueeze(2))
             cache_layer.values.add_(per_layer_coeff * v_edit.unsqueeze(0).unsqueeze(2))
 
-    def _make_steerer(self, layers, coefficient):
-        vectors = [self.axis[l] for l in layers]
-        coeffs = [coefficient] * len(layers)
+    def _make_steerer(self, layer_idx, coefficient):
         return ActivationSteering(
             self.model,
-            steering_vectors=vectors,
-            coefficients=coeffs,
-            layer_indices=layers,
-            intervention_type="addition",
+            steering_vector=self.axis[layer_idx],
+            coefficient=coefficient,
+            layer_idx=layer_idx,
         )
 
     def _tokenize(self, text):
@@ -269,50 +295,76 @@ def main():
     probe_categories = {p: cat for p, cat in PROBES}
     probes_with_suffix = [f"{p} Reply in one sentence." for p in probes]
 
+    # Three conditions:
+    # 1. baseline: no intervention
+    # 2. gen_steering: activation steering at L21 during generation (propagates in residual stream)
+    # 3. kv_edit: post-hoc KV cache edit at L15-19 (no propagation)
     conditions = [
         ("baseline", None, 0),
-        ("past_only", [TARGET_LAYER], PAST_COEFF),
-        ("past_multilayer", PAST_LAYERS, PAST_MULTILAYER_COEFF),
-        ("gen_only", [TARGET_LAYER], GEN_COEFF),
+        ("gen_steering", "gen", GEN_COEFF),
+        ("kv_edit", "kv", KV_COEFF),
     ]
 
     total = len(probes) * len(conditions) * args.num_samples
-    print(f"\n=== KV Cache Persona Persistence Experiment ===")
-    print(f"  Probes: {len(probes)}")
-    print(f"  Conditions: {[c[0] for c in conditions]}")
-    print(f"  Samples per (probe, condition): {args.num_samples}")
-    print(f"  Total generations: {total}")
-    print()
-
-    exp = ProbeExperiment()
-    gen_kwargs = dict(max_new_tokens=args.max_new_tokens, temperature=args.temperature, do_sample=True)
 
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, "results.csv")
     fieldnames = ["condition", "coefficient", "sample_idx", "probe", "probe_category",
                    "response", "axis_projection"]
 
+    # Load existing results to enable resume
+    done_keys = set()
+    if os.path.exists(csv_path):
+        import pandas as pd
+        existing = pd.read_csv(csv_path)
+        for _, r in existing.iterrows():
+            done_keys.add((r["condition"], r["probe"], int(r["sample_idx"])))
+        print(f"Resuming: {len(done_keys)} existing results found, skipping those.")
+    else:
+        existing = None
+
+    remaining = total - len(done_keys)
+    print(f"\n=== KV Cache Persona Persistence Experiment ===")
+    print(f"  Probes: {len(probes)}")
+    print(f"  Conditions: {[c[0] for c in conditions]}")
+    print(f"  Samples per (probe, condition): {args.num_samples}")
+    print(f"  Total generations: {total} ({remaining} remaining)")
+    print()
+
+    if remaining == 0:
+        print("All generations already complete.")
+        return
+
+    exp = ProbeExperiment()
+    gen_kwargs = dict(max_new_tokens=args.max_new_tokens, temperature=args.temperature, do_sample=True)
+
+    # Append mode: write header only if file doesn't exist
+    write_header = not os.path.exists(csv_path)
     done = 0
     t0 = time.time()
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
+        if write_header:
+            writer.writeheader()
 
-        for cond_name, layers, coeff in conditions:
+        for cond_name, cond_type, coeff in conditions:
             for probe_raw, probe_full in zip(probes, probes_with_suffix):
                 for sample_idx in range(args.num_samples):
+                    if (cond_name, probe_raw, sample_idx) in done_keys:
+                        continue
+
                     sample_seed = args.seed + hash((cond_name, probe_raw, sample_idx)) % (2**31)
                     torch.manual_seed(sample_seed)
 
-                    if cond_name == "baseline":
+                    if cond_type is None:
                         response, axis_proj = exp.generate_baseline(prefix, probe_full, **gen_kwargs)
-                    elif cond_name in ("past_only", "past_multilayer"):
+                    elif cond_type == "kv":
                         response, axis_proj = exp._two_phase(
                             prefix, probe_full,
-                            kv_edit_layers=layers, kv_edit_coeff=coeff, **gen_kwargs)
-                    elif cond_name == "gen_only":
-                        steerer = exp._make_steerer(layers, coeff)
+                            kv_edit_layers=KV_LAYERS, kv_edit_coeff=coeff, **gen_kwargs)
+                    elif cond_type == "gen":
+                        steerer = exp._make_steerer(GEN_LAYER, coeff)
                         response, axis_proj = exp._two_phase(
                             prefix, probe_full, phase2_steerer=steerer, **gen_kwargs)
 
@@ -331,11 +383,11 @@ def main():
 
                     preview = response[:80].replace("\n", " ")
                     elapsed = time.time() - t0
-                    eta = (total - done) / (done / elapsed) if done > 0 else 0
-                    print(f"  [{done}/{total} | ETA {eta:.0f}s] {cond_name}(c={coeff}) | "
+                    eta = (remaining - done) / (done / elapsed) if done > 0 else 0
+                    print(f"  [{done}/{remaining} | ETA {eta:.0f}s] {cond_name}(c={coeff}) | "
                           f"{probe_raw[:40]}... #{sample_idx}: {preview}...")
 
-    print(f"\n=== Done. {done} generations in {time.time() - t0:.1f}s. Saved to {csv_path} ===")
+    print(f"\n=== Done. {done} new generations in {time.time() - t0:.1f}s. Saved to {csv_path} ===")
 
 
 if __name__ == "__main__":
