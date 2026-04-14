@@ -27,31 +27,6 @@ This has a direct implication for KV cache persona editing (see Mini Experiment 
 
 ---
 
-## Summary table
-
-**Mean projection on the assistant axis (higher = more assistant-like):**
-
-| Case | Condition | User turns | Assistant turns |
-|---|---|---|---|
-| Delusion  | Cap assistant | −68.2 (σ 18.6) | **+34.3** (σ 1.2) |
-| Delusion  | Unsteered     | −65.6 (σ 16.6) | −76.9 (σ 21.6) |
-| Jailbreak | Cap assistant |  −2.5 (σ  4.8) | **+39.1** (σ 6.3) |
-| Jailbreak | Unsteered     |  −7.3 (σ  5.3) | −52.0 (σ 29.0) |
-| Self-harm | Cap assistant | −31.5 (σ 16.7) | **+35.1** (σ 1.6) |
-| Self-harm | Unsteered     | −33.1 (σ 17.0) | −60.3 (σ 26.0) |
-
-**User-token Δ across conditions** (the quantity this experiment is about):
-
-| Case | `cap_asst` mean | `unsteered` mean | |Δ| |
-|---|---|---|---|
-| Delusion  | −68.2 | −65.6 | 2.6 |
-| Jailbreak |  −2.5 |  −7.3 | 4.8 |
-| Self-harm | −31.5 | −33.1 | 1.6 |
-
-In every case the two conditions agree on user-token projections to within a few units — far below the roughly 60–110 unit gap observed on assistant tokens — so the central claim holds uniformly.
-
----
-
 ## Robustness check: Jailbreak and Self-harm
 
 ![Robustness figure](results/figure_controls.png)

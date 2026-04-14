@@ -1,4 +1,4 @@
-# KV Cache Persona Persistence Experiment — Qwen 3 32B
+# KV Cache Persona Persistence Experiment
 
 Supplementary material for Section 3.4 Mini Experiment 2 of *Where is the mind? Persona vectors and LLM individuation* (Beckmann & Butlin, 2026).
 
