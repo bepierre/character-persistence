@@ -61,35 +61,118 @@ PROBES = [
 ]
 
 
-class ActivationSteering:
-    """Context manager that adds a steering vector to a layer's output during forward passes."""
+CAPPING_EXPERIMENT = "layers_46:54-p0.25"
 
-    def __init__(self, model, steering_vector, coefficient, layer_idx):
+
+def load_capping_config(hf_token=None):
+    path = hf_hub_download(
+        repo_id="lu-christina/assistant-axis-vectors",
+        filename="qwen-3-32b/capping_config.pt",
+        repo_type="dataset",
+        token=hf_token,
+    )
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+class CappingSteering:
+    """Context manager that installs Lu's assistant-axis capping hooks.
+
+    Exactly the same mechanism as exp1's cap_asst condition: projection onto
+    each layer's calibrated vector is clamped to its stored tau threshold.
+    Used as a gen-steering alternative for exp2 when single-layer additive
+    steering is too weak to flip the persona.
+    """
+
+    def __init__(self, model, capping_config, experiment_id=CAPPING_EXPERIMENT):
         self.model = model
-        self.steering_vector = steering_vector.to(model.device, dtype=model.dtype)
-        self.coefficient = coefficient
-        self.layer_idx = layer_idx
-        self._handle = None
+        self.cfg = capping_config
+        self.exp_id = experiment_id
+        self._handles = []
 
     def __enter__(self):
-        layer_module = self.model.model.layers[self.layer_idx]
-        vec = self.steering_vector
-        coeff = self.coefficient
+        experiment = next(
+            (e for e in self.cfg["experiments"] if e["id"] == self.exp_id), None
+        )
+        if experiment is None:
+            raise ValueError(f"Experiment '{self.exp_id}' not found in capping config.")
+        for iv in experiment["interventions"]:
+            if "cap" not in iv:
+                continue
+            vec_data = self.cfg["vectors"][iv["vector"]]
+            layer_idx = vec_data["layer"]
+            vector = vec_data["vector"].float()
+            tau = float(iv["cap"])
 
-        def hook_fn(module, input, output):
-            hidden = output[0] if isinstance(output, tuple) else output
-            hidden = hidden + coeff * vec
-            if isinstance(output, tuple):
-                return (hidden,) + output[1:]
-            return hidden
+            def make_hook(vec, threshold):
+                def hook_fn(module, inp, out):
+                    h = out[0] if isinstance(out, tuple) else out
+                    v = vec.to(h.device, dtype=h.dtype)
+                    v_n = v / (v.norm() + 1e-8)
+                    proj = torch.einsum("bld,d->bl", h.float(), v_n.float())
+                    excess = (proj - threshold).clamp(min=0.0)
+                    h2 = h.float() - torch.einsum("bl,d->bld", excess, v_n.float())
+                    h2 = h2.to(out[0].dtype if isinstance(out, tuple) else out.dtype)
+                    return (h2, *out[1:]) if isinstance(out, tuple) else h2
+                return hook_fn
 
-        self._handle = layer_module.register_forward_hook(hook_fn)
+            self._handles.append(
+                self.model.model.layers[layer_idx].register_forward_hook(
+                    make_hook(vector, tau)
+                )
+            )
         return self
 
     def __exit__(self, *args):
-        if self._handle is not None:
-            self._handle.remove()
-            self._handle = None
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+
+class ActivationSteering:
+    """Context manager that adds a steering vector at one or more layers.
+
+    `layer_idx` and `steering_vector` may each be a single value or a list:
+      - single layer + single vector: standard Gemma-style additive steering
+      - list of layers + list of vectors: multi-layer additive steering (one
+        independent addition per layer, all with the shared coefficient). This
+        mirrors the multi-layer intervention shape Lu uses for capping.
+    """
+
+    def __init__(self, model, steering_vector, coefficient, layer_idx):
+        self.model = model
+        if isinstance(layer_idx, (list, tuple)):
+            self.layers = list(layer_idx)
+            assert isinstance(steering_vector, (list, tuple)) and \
+                   len(steering_vector) == len(self.layers), \
+                "steering_vector must be a list matching layer_idx length"
+            self.vectors = [v.to(model.device, dtype=model.dtype) for v in steering_vector]
+        else:
+            self.layers = [layer_idx]
+            self.vectors = [steering_vector.to(model.device, dtype=model.dtype)]
+        self.coefficient = coefficient
+        self._handles = []
+
+    def __enter__(self):
+        coeff = self.coefficient
+        for L, vec in zip(self.layers, self.vectors):
+            v = vec
+            def make_hook(v_local):
+                def hook_fn(module, input, output):
+                    hidden = output[0] if isinstance(output, tuple) else output
+                    hidden = hidden + coeff * v_local
+                    if isinstance(output, tuple):
+                        return (hidden,) + output[1:]
+                    return hidden
+                return hook_fn
+            self._handles.append(
+                self.model.model.layers[L].register_forward_hook(make_hook(v))
+            )
+        return self
+
+    def __exit__(self, *args):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
 
 
 class ProbeExperiment:
@@ -117,6 +200,10 @@ class ProbeExperiment:
         )
         self.axis = torch.load(axis_path, map_location="cpu", weights_only=True)
         print(f"  Axis shape: {self.axis.shape}")
+
+        print("Downloading capping config...")
+        self.capping_config = load_capping_config(os.getenv("HF_TOKEN"))
+        print(f"  Capping experiment default: {CAPPING_EXPERIMENT}")
 
         self._monitor_layer = MONITOR_LAYER
         self._monitor_axis = self.axis[self._monitor_layer].float()
@@ -229,6 +316,13 @@ class ProbeExperiment:
                 cache_layer.values.add_(coefficient * v_edit.unsqueeze(0).unsqueeze(2))
 
     def _make_steerer(self, layer_idx, coefficient):
+        if isinstance(layer_idx, (list, tuple)):
+            return ActivationSteering(
+                self.model,
+                steering_vector=[self.axis[L] for L in layer_idx],
+                coefficient=coefficient,
+                layer_idx=list(layer_idx),
+            )
         return ActivationSteering(
             self.model,
             steering_vector=self.axis[layer_idx],
@@ -335,7 +429,44 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--transcript", type=str, default="transcript.json")
+    parser.add_argument("--probes", type=str, default=None,
+                        help="Comma-separated probe substrings to filter the probe list "
+                             "(e.g. 'Who are you,meds'). Default: all 13 probes.")
+    parser.add_argument("--conditions", type=str, default=None,
+                        help="Comma-separated condition subset: baseline,gen_steering,kv_edit")
+    parser.add_argument("--kv_layers", type=str, default=None,
+                        help="Override KV edit layers, e.g. '20-25' or '18,19,20,21'")
+    parser.add_argument("--kv_coeff", type=float, default=None,
+                        help="Override KV edit coefficient.")
+    parser.add_argument("--kv_layer_ranges", type=str, default=None,
+                        help="Semicolon-separated list of layer ranges for a kv_edit "
+                             "sweep, e.g. '20-25;32-36;46-50'. Crossed with --kv_coeffs.")
+    parser.add_argument("--kv_coeffs", type=str, default=None,
+                        help="Comma-separated list of kv_edit coefficients, e.g. '0.4,1,2,4'. "
+                             "Crossed with --kv_layer_ranges.")
+    parser.add_argument("--gen_layer", type=int, default=None,
+                        help="Override gen-steering layer.")
+    parser.add_argument("--gen_layers", type=str, default=None,
+                        help="Comma-separated layer sweep for gen_steering "
+                             "(e.g. '20,30,40,46,50,54'). Each layer is run as "
+                             "its own pseudo-condition 'gen_steering_L{n}'.")
+    parser.add_argument("--gen_layer_range", type=str, default=None,
+                        help="Single layer range (e.g. '32-47') applied simultaneously "
+                             "for gen_steering — multi-layer additive steering.")
+    parser.add_argument("--gen_coeff", type=float, default=None,
+                        help="Override gen-steering coefficient.")
     args = parser.parse_args()
+
+    kv_layers = KV_LAYERS
+    if args.kv_layers:
+        if "-" in args.kv_layers and "," not in args.kv_layers:
+            a, b = args.kv_layers.split("-")
+            kv_layers = list(range(int(a), int(b) + 1))
+        else:
+            kv_layers = [int(x) for x in args.kv_layers.split(",")]
+    kv_coeff = args.kv_coeff if args.kv_coeff is not None else KV_COEFF
+    gen_layer = args.gen_layer if args.gen_layer is not None else GEN_LAYER
+    gen_coeff = args.gen_coeff if args.gen_coeff is not None else GEN_COEFF
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -346,19 +477,71 @@ def main():
     prefix = transcript["conversation"][:CUT_POINT]
     print(f"Loaded transcript ({len(transcript['conversation'])} messages, using first {CUT_POINT})")
 
-    probes = [p for p, _ in PROBES]
+    all_probes = [p for p, _ in PROBES]
     probe_categories = {p: cat for p, cat in PROBES}
+    if args.probes:
+        needles = [s.strip().lower() for s in args.probes.split(",") if s.strip()]
+        probes = [p for p in all_probes if any(n in p.lower() for n in needles)]
+        if not probes:
+            raise SystemExit(f"No probes matched {needles!r}")
+    else:
+        probes = all_probes
     probes_with_suffix = [f"{p} Reply in one sentence." for p in probes]
 
-    # Three conditions:
-    # 1. baseline:      no intervention
-    # 2. gen_steering:  activation steering at GEN_LAYER during generation
-    # 3. kv_edit:       post-hoc KV cache edit at KV_LAYERS (assistant positions only)
-    conditions = [
-        ("baseline", None, 0),
-        ("gen_steering", "gen", GEN_COEFF),
-        ("kv_edit", "kv", KV_COEFF),
+    if args.gen_layer_range:
+        a, b = args.gen_layer_range.split("-")
+        gen_layer_override = list(range(int(a), int(b) + 1))
+    else:
+        gen_layer_override = gen_layer
+
+    all_conditions = [
+        ("baseline",     None,    0,         None),
+        ("gen_steering", "gen",   gen_coeff, gen_layer_override),
+        ("cap_gen",      "cap",   0,         None),
+        ("kv_edit",      "kv",    kv_coeff,  None),
     ]
+    if args.conditions:
+        wanted = set(c.strip() for c in args.conditions.split(","))
+        conditions = [c for c in all_conditions if c[0] in wanted]
+    else:
+        conditions = all_conditions
+
+    # Gen-steering layer sweep: replace the single gen_steering entry with one
+    # pseudo-condition per layer, tagged gen_steering_L{n}, so results can be
+    # compared in a single CSV.
+    if args.gen_layers:
+        sweep_layers = [int(x) for x in args.gen_layers.split(",") if x.strip()]
+        new_conditions = []
+        for c in conditions:
+            if c[0] == "gen_steering":
+                for L in sweep_layers:
+                    new_conditions.append((f"gen_steering_L{L}", "gen", gen_coeff, L))
+            else:
+                new_conditions.append(c)
+        conditions = new_conditions
+
+    # KV-edit sweep: cross-product of layer ranges and coefficients, producing
+    # one pseudo-condition per (range, coeff) pair named kv_L{range}_c{coeff}.
+    if args.kv_layer_ranges and args.kv_coeffs:
+        range_specs = []
+        for rs in args.kv_layer_ranges.split(";"):
+            rs = rs.strip()
+            if not rs:
+                continue
+            if "-" in rs and "," not in rs:
+                a, b = rs.split("-")
+                range_specs.append((rs, list(range(int(a), int(b) + 1))))
+            else:
+                range_specs.append((rs, [int(x) for x in rs.split(",")]))
+        coeff_specs = [float(x) for x in args.kv_coeffs.split(",") if x.strip()]
+        sweep_conditions = []
+        for rs_label, rs_layers in range_specs:
+            for cv in coeff_specs:
+                sweep_conditions.append(
+                    (f"kv_L{rs_label}_c{cv}", "kv", cv, rs_layers)
+                )
+        new_conditions = [c for c in conditions if c[0] != "kv_edit"] + sweep_conditions
+        conditions = new_conditions
 
     total = len(probes) * len(conditions) * args.num_samples
 
@@ -378,8 +561,8 @@ def main():
     remaining = total - len(done_keys)
     print(f"\n=== KV Cache Persona Persistence Experiment (Qwen 3 32B) ===")
     print(f"  Model:      {MODEL}")
-    print(f"  GEN_LAYER:  {GEN_LAYER}  (coeff {GEN_COEFF})")
-    print(f"  KV_LAYERS:  {KV_LAYERS}  (coeff {KV_COEFF}, assistant tokens only)")
+    print(f"  GEN_LAYER:  {gen_layer}  (coeff {gen_coeff})")
+    print(f"  KV_LAYERS:  {kv_layers}  (coeff {kv_coeff}, assistant tokens only)")
     print(f"  MONITOR:    layer {MONITOR_LAYER}")
     print(f"  Probes:     {len(probes)}")
     print(f"  Conditions: {[c[0] for c in conditions]}")
@@ -403,7 +586,7 @@ def main():
         if write_header:
             writer.writeheader()
 
-        for cond_name, cond_type, coeff in conditions:
+        for cond_name, cond_type, coeff, layer_override in conditions:
             for probe_raw, probe_full in zip(probes, probes_with_suffix):
                 for sample_idx in range(args.num_samples):
                     if (cond_name, probe_raw, sample_idx) in done_keys:
@@ -415,11 +598,17 @@ def main():
                     if cond_type is None:
                         response, axis_proj = exp.generate_baseline(prefix, probe_full, **gen_kwargs)
                     elif cond_type == "kv":
+                        use_kv_layers = layer_override if layer_override is not None else kv_layers
                         response, axis_proj = exp._two_phase(
                             prefix, probe_full,
-                            kv_edit_layers=KV_LAYERS, kv_edit_coeff=coeff, **gen_kwargs)
+                            kv_edit_layers=use_kv_layers, kv_edit_coeff=coeff, **gen_kwargs)
                     elif cond_type == "gen":
-                        steerer = exp._make_steerer(GEN_LAYER, coeff)
+                        use_layer = layer_override if layer_override is not None else gen_layer
+                        steerer = exp._make_steerer(use_layer, coeff)
+                        response, axis_proj = exp._two_phase(
+                            prefix, probe_full, phase2_steerer=steerer, **gen_kwargs)
+                    elif cond_type == "cap":
+                        steerer = CappingSteering(exp.model, exp.capping_config)
                         response, axis_proj = exp._two_phase(
                             prefix, probe_full, phase2_steerer=steerer, **gen_kwargs)
 

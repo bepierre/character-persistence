@@ -25,11 +25,11 @@ Usage:
     export HF_TOKEN=hf-...
     python run_experiment.py --output_dir results
 
-    Output: results/results.csv  (one row per turn per condition per case)
+    Output: results/<case>_<condition>.json  (conversation with per-turn
+            assistant-axis projection attached to each message)
 """
 
 import argparse
-import csv
 import json
 import os
 import time
@@ -42,7 +42,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ---------- config ----------
 MODEL = "Qwen/Qwen3-32B"
-MONITOR_LAYER = 32          # official target layer for Qwen 3 32B
+MONITOR_LAYER = 50          # middle of capping range (46-53), matches old assistant-axis-user-tokens v3
 CAPPING_EXPERIMENT = "layers_46:54-p0.25"
 MAX_NEW_TOKENS = 300
 TEMPERATURE = 0.7
@@ -68,11 +68,16 @@ def load_capping_config(hf_token=None):
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def build_capping_hooks(model, capping_config, experiment_id):
+def build_capping_hooks(model, capping_config, experiment_id, prefill_mask=None):
     """Register forward hooks that cap the projection onto each steering vector.
 
+    If `prefill_mask` (1-D bool tensor of length = prefill seq_len) is given,
+    the cap is applied only at positions where the mask is True during the
+    prefill forward pass, and unconditionally during every decode step
+    (1-token forwards = new assistant tokens). This lets us cap assistant
+    positions only while leaving user positions clean.
+
     Returns a list of hook handles; call h.remove() on each when done.
-    Capping: projection is prevented from exceeding tau (the threshold stored in config).
     """
     experiment = next(
         (e for e in capping_config["experiments"] if e["id"] == experiment_id), None
@@ -94,9 +99,16 @@ def build_capping_hooks(model, capping_config, experiment_id):
                 h = out[0] if isinstance(out, tuple) else out
                 v = vec.to(h.device, dtype=h.dtype)
                 v_n = v / (v.norm() + 1e-8)
-                # Compute excess projection above tau for every position
                 proj = torch.einsum("bld,d->bl", h.float(), v_n.float())
                 excess = (proj - threshold).clamp(min=0.0)
+                seq_len = h.shape[1]
+                if prefill_mask is not None:
+                    if seq_len == prefill_mask.numel():
+                        m = prefill_mask.to(h.device).float().unsqueeze(0)
+                        excess = excess * m
+                    elif seq_len != 1:
+                        # Unexpected call shape; leave unchanged.
+                        excess = excess * 0.0
                 h = h.float() - torch.einsum("bl,d->bld", excess, v_n.float())
                 h = h.to(out[0].dtype if isinstance(out, tuple) else out.dtype)
                 return (h, *out[1:]) if isinstance(out, tuple) else h
@@ -137,57 +149,23 @@ def build_turn_spans(tokenizer, conversation):
 
 # ---------- projection extraction ----------
 
-def compute_turn_projections(model, tokenizer, conversation, axis_vec, layer):
-    """Run a single clean forward pass and return per-turn mean projections.
+# ---------- fused generation + monitoring ----------
 
-    Returns list of {turn, role, projection} dicts.
+def generate_turn(model, tokenizer, conversation, axis_n, monitor_layer,
+                   capping_config, experiment_id, cap,
+                   max_new_tokens=MAX_NEW_TOKENS, temperature=TEMPERATURE):
+    """Generate the next assistant turn AND record per-turn monitor projections.
+
+    `conversation` already ends in the new user message. This function runs
+    a single generate() call, captures layer `monitor_layer` residuals for
+    every position (prefill + decoded assistant tokens), and returns:
+
+        response_text, user_projection, assistant_projection
+
+    Capping (if cap=True) is applied via a prefill mask that fires only on
+    assistant positions in the prefix, plus unconditionally on every 1-token
+    decode step (new assistant tokens). User positions are never clamped.
     """
-    full_text = tokenizer.apply_chat_template(
-        conversation, tokenize=False, add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    input_ids = tokenizer(
-        full_text, return_tensors="pt", add_special_tokens=False
-    )["input_ids"].to(model.device)
-
-    # Capture activations at the target layer
-    captured = {}
-
-    def hook_fn(module, inp, out):
-        h = out[0] if isinstance(out, tuple) else out
-        captured["acts"] = h[0].float().cpu()  # (seq_len, hidden)
-
-    handle = model.model.layers[layer].register_forward_hook(hook_fn)
-    try:
-        with torch.no_grad():
-            model(input_ids=input_ids)
-    finally:
-        handle.remove()
-
-    acts = captured["acts"]  # (seq_len, hidden)
-    axis_n = axis_vec.float() / axis_vec.float().norm()
-
-    spans = build_turn_spans(tokenizer, conversation)
-    results = []
-    for span in spans:
-        s, e = span["start"], span["end"]
-        if s >= e or e > acts.shape[0]:
-            continue
-        mean_act = acts[s:e].mean(dim=0)
-        proj = float(mean_act @ axis_n)
-        results.append({
-            "turn": span["turn"],
-            "role": span["role"],
-            "projection": proj,
-        })
-    return results
-
-
-# ---------- generation ----------
-
-def generate_response(model, tokenizer, conversation, max_new_tokens=MAX_NEW_TOKENS,
-                      temperature=TEMPERATURE):
-    """Generate the next assistant turn given a conversation so far."""
     full_text = tokenizer.apply_chat_template(
         conversation, tokenize=False, add_generation_prompt=True,
         enable_thinking=False,
@@ -195,45 +173,104 @@ def generate_response(model, tokenizer, conversation, max_new_tokens=MAX_NEW_TOK
     input_ids = tokenizer(
         full_text, return_tensors="pt", add_special_tokens=False
     )["input_ids"].to(model.device)
+    prefix_len = input_ids.shape[1]
 
-    with torch.no_grad():
-        out = model.generate(
-            input_ids=input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-        )
-    response = tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True)
-    return response.strip()
+    # Build assistant-only mask over the prefill positions.
+    # Spans are computed on the no-generation-prompt encoding; they're valid
+    # as indices into the with-generation-prompt tokenisation because the
+    # prefix is identical up to the end of the last user message.
+    spans = build_turn_spans(tokenizer, conversation)
+    prefill_mask = torch.zeros(prefix_len, dtype=torch.bool)
+    for s in spans:
+        if s["role"] == "assistant":
+            end = min(s["end"], prefix_len)
+            if s["start"] < end:
+                prefill_mask[s["start"]:end] = True
+
+    # Find the last user span so we can compute user-turn projection after generation.
+    last_user = next(s for s in reversed(spans) if s["role"] == "user")
+
+    captured = []  # list of (seq_chunk, hidden) tensors
+
+    def mon_hook(module, inp, out):
+        h = out[0] if isinstance(out, tuple) else out
+        captured.append(h[0].float().cpu())  # (seq_chunk, hidden)
+
+    cap_handles = (
+        build_capping_hooks(model, capping_config, experiment_id,
+                            prefill_mask=prefill_mask)
+        if cap else []
+    )
+    mon_handle = model.model.layers[monitor_layer].register_forward_hook(mon_hook)
+    try:
+        with torch.no_grad():
+            out = model.generate(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+            )
+    finally:
+        mon_handle.remove()
+        for h in cap_handles:
+            h.remove()
+
+    all_acts = torch.cat(captured, dim=0)  # (prefix_len + n_new, hidden)
+    n_new = out.shape[1] - prefix_len
+
+    user_slice = all_acts[last_user["start"]:last_user["end"]]
+    user_proj = float(user_slice.mean(dim=0) @ axis_n)
+
+    if n_new > 0:
+        asst_slice = all_acts[prefix_len:prefix_len + n_new]
+        asst_proj = float(asst_slice.mean(dim=0) @ axis_n)
+    else:
+        asst_proj = float("nan")
+
+    response = tokenizer.decode(
+        out[0, prefix_len:], skip_special_tokens=True
+    ).strip()
+    return response, user_proj, asst_proj
 
 
 def generate_conversation(model, tokenizer, user_messages, capping_config,
-                          experiment_id, cap=True, verbose=True):
-    """Generate a full conversation from a list of user messages.
+                          experiment_id, axis_vec, monitor_layer,
+                          cap=True, verbose=True):
+    """Generate a full conversation with fused per-turn monitoring.
 
-    If cap=True, capping hooks are active during each assistant generation turn
-    (applied to all token positions during the generate() call). User-turn text
-    is the same in both conditions; only the assistant responses differ.
-
-    Returns the completed conversation as a list of {role, content} dicts.
+    Returns an enriched conversation list: each message is
+    {turn, role, content, projection}.
     """
-    conversation = []
+    axis_n = axis_vec.float() / axis_vec.float().norm()
+    conversation = []          # plain role/content used for chat template
+    enriched = []              # role/content/projection for output JSON
     for i, user_msg in enumerate(user_messages):
         conversation.append({"role": "user", "content": user_msg})
 
-        handles = build_capping_hooks(model, capping_config, experiment_id) if cap else []
-        try:
-            response = generate_response(model, tokenizer, conversation)
-        finally:
-            for h in handles:
-                h.remove()
-
+        response, user_proj, asst_proj = generate_turn(
+            model, tokenizer, conversation, axis_n, monitor_layer,
+            capping_config, experiment_id, cap=cap,
+        )
         conversation.append({"role": "assistant", "content": response})
+
+        enriched.append({
+            "turn": len(enriched),
+            "role": "user",
+            "content": user_msg,
+            "projection": user_proj,
+        })
+        enriched.append({
+            "turn": len(enriched),
+            "role": "assistant",
+            "content": response,
+            "projection": asst_proj,
+        })
         if verbose:
             tag = "cap" if cap else "unc"
-            print(f"      [{tag}] turn {i}: {response[:70].replace(chr(10), ' ')}...")
+            print(f"      [{tag}] turn {i}: user={user_proj:+.1f} asst={asst_proj:+.1f}  "
+                  f"{response[:60].replace(chr(10), ' ')}...")
 
-    return conversation
+    return enriched
 
 
 # ---------- main ----------
@@ -244,6 +281,8 @@ def main():
     )
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cases", type=str, default=None,
+                        help="Comma-separated subset of case names to run (default: all).")
     parser.add_argument("--load_in_4bit", action="store_true",
                         help="Load model in 4-bit quantization (fits on a single 24GB GPU).")
     args = parser.parse_args()
@@ -283,71 +322,47 @@ def main():
     print(f"  Capping experiment: {CAPPING_EXPERIMENT}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    csv_path = os.path.join(args.output_dir, "results.csv")
-    fieldnames = ["case", "condition", "turn", "role", "projection", "response"]
-
-    write_header = not os.path.exists(csv_path)
-    rows_written = 0
     t0 = time.time()
+    transcripts_written = 0
 
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
+    selected = set(c.strip() for c in args.cases.split(",")) if args.cases else None
+    cases_to_run = [c for c in CASES if selected is None or c[0] in selected]
+    for case_name, transcript_path in cases_to_run:
+        with open(transcript_path) as tf:
+            data = json.load(tf)
+        user_messages = data["user_messages"]
+        print(f"\n{'='*60}")
+        print(f"  Case: {case_name} ({len(user_messages)} user turns)")
+        print(f"{'='*60}")
 
-        for case_name, transcript_path in CASES:
-            with open(transcript_path) as tf:
-                data = json.load(tf)
-            user_messages = data["user_messages"]
-            print(f"\n{'='*60}")
-            print(f"  Case: {case_name} ({len(user_messages)} user turns)")
-            print(f"{'='*60}")
+        for condition in CONDITIONS:
+            cap = condition == "cap_asst"
+            print(f"\n  Condition: {condition} (cap={cap})")
+            enriched = generate_conversation(
+                model, tokenizer, user_messages,
+                capping_config, CAPPING_EXPERIMENT,
+                axis_vec, MONITOR_LAYER,
+                cap=cap, verbose=True,
+            )
 
-            for condition in CONDITIONS:
-                cap = condition == "cap_asst"
-                print(f"\n  Condition: {condition} (cap={cap})")
-                conversation = generate_conversation(
-                    model, tokenizer, user_messages,
-                    capping_config, CAPPING_EXPERIMENT,
-                    cap=cap, verbose=True,
-                )
-
-                # Save full conversation transcript to JSON
-                convo_path = os.path.join(
-                    args.output_dir,
-                    f"{case_name.lower().replace(' ', '_').replace('-', '')}_{condition}.json",
-                )
-                with open(convo_path, "w", encoding="utf-8") as jf:
-                    json.dump({"case": case_name, "condition": condition,
-                               "conversation": conversation}, jf, indent=2)
-
-                print(f"  Computing projections...")
-                projections = compute_turn_projections(
-                    model, tokenizer, conversation, axis_vec, MONITOR_LAYER
-                )
-
-                # Build a turn→response map for assistant turns
-                response_map = {
-                    msg_i: msg["content"]
-                    for msg_i, msg in enumerate(conversation)
-                    if msg["role"] == "assistant"
-                }
-
-                for p in projections:
-                    writer.writerow({
-                        "case": case_name,
-                        "condition": condition,
-                        "turn": p["turn"],
-                        "role": p["role"],
-                        "projection": f"{p['projection']:.4f}",
-                        "response": response_map.get(p["turn"], ""),
-                    })
-                    rows_written += 1
-                f.flush()
-                print(f"  Wrote {len(projections)} rows. Transcript → {convo_path}")
+            convo_path = os.path.join(
+                args.output_dir,
+                f"{case_name.lower().replace(' ', '_').replace('-', '')}_{condition}.json",
+            )
+            with open(convo_path, "w", encoding="utf-8") as jf:
+                json.dump({
+                    "case": case_name,
+                    "condition": condition,
+                    "model": MODEL,
+                    "monitor_layer": MONITOR_LAYER,
+                    "capping_experiment": CAPPING_EXPERIMENT,
+                    "conversation": enriched,
+                }, jf, indent=2)
+            transcripts_written += 1
+            print(f"  Wrote transcript → {convo_path}")
 
     elapsed = time.time() - t0
-    print(f"\n=== Done. {rows_written} rows in {elapsed:.1f}s. Saved to {csv_path} ===")
+    print(f"\n=== Done. {transcripts_written} transcripts in {elapsed:.1f}s. Saved to {args.output_dir} ===")
 
 
 if __name__ == "__main__":
