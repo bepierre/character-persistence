@@ -22,16 +22,16 @@ else:
     plt.rcParams["font.sans-serif"] = ["Inter", "Helvetica", "Arial", "DejaVu Sans"]
 
 
-CONDITIONS = ["baseline", "gen_steering", "kv_L32-47_c1.5"]
+CONDITIONS = ["baseline", "gen_steering", "kv_edit"]
 COND_LABELS = {
-    "baseline":        "Baseline",
-    "gen_steering":    "Gen steering (L32, c=5)",
-    "kv_L32-47_c1.5":  "KV edit (L32–47, c=1.5)",
+    "baseline":     "Baseline",
+    "gen_steering": "Gen steering (L32, c=5)",
+    "kv_edit":      "KV edit (L32–47, c=1.5)",
 }
 COND_COLORS = {
-    "baseline":        "#7E57C2",  # purple
-    "gen_steering":    "#4CAF50",  # green
-    "kv_L32-47_c1.5":  "#1E88E5",  # blue
+    "baseline":     "#9E9E9E",  # neutral grey
+    "gen_steering": "#FB8C00",  # orange
+    "kv_edit":      "#1E88E5",  # blue
 }
 
 SHORT = {

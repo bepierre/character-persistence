@@ -208,6 +208,7 @@ def generate_turn(model, tokenizer, conversation, axis_n, monitor_layer,
                 input_ids=input_ids,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
+                top_p=0.9,
                 do_sample=True,
             )
     finally:
@@ -235,7 +236,8 @@ def generate_turn(model, tokenizer, conversation, axis_n, monitor_layer,
 
 def generate_conversation(model, tokenizer, user_messages, capping_config,
                           experiment_id, axis_vec, monitor_layer,
-                          cap=True, verbose=True):
+                          cap=True, verbose=True, temperature=TEMPERATURE,
+                          primer_assistant=None):
     """Generate a full conversation with fused per-turn monitoring.
 
     Returns an enriched conversation list: each message is
@@ -247,10 +249,18 @@ def generate_conversation(model, tokenizer, user_messages, capping_config,
     for i, user_msg in enumerate(user_messages):
         conversation.append({"role": "user", "content": user_msg})
 
-        response, user_proj, asst_proj = generate_turn(
-            model, tokenizer, conversation, axis_n, monitor_layer,
-            capping_config, experiment_id, cap=cap,
-        )
+        # Seed the first assistant turn with a primer if provided. The primer
+        # fixes what the model "said" on turn 0, letting subsequent turns
+        # generate from an already-jailbroken / already-drifted state.
+        if i == 0 and primer_assistant is not None:
+            response = primer_assistant
+            user_proj = float("nan")
+            asst_proj = float("nan")
+        else:
+            response, user_proj, asst_proj = generate_turn(
+                model, tokenizer, conversation, axis_n, monitor_layer,
+                capping_config, experiment_id, cap=cap, temperature=temperature,
+            )
         conversation.append({"role": "assistant", "content": response})
 
         enriched.append({
@@ -281,6 +291,8 @@ def main():
     )
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--temperature", type=float, default=TEMPERATURE,
+                        help=f"Sampling temperature (default {TEMPERATURE}).")
     parser.add_argument("--cases", type=str, default=None,
                         help="Comma-separated subset of case names to run (default: all).")
     parser.add_argument("--load_in_4bit", action="store_true",
@@ -331,8 +343,10 @@ def main():
         with open(transcript_path) as tf:
             data = json.load(tf)
         user_messages = data["user_messages"]
+        primer_assistant = data.get("primer_assistant")
         print(f"\n{'='*60}")
-        print(f"  Case: {case_name} ({len(user_messages)} user turns)")
+        print(f"  Case: {case_name} ({len(user_messages)} user turns"
+              f"{' + primer' if primer_assistant else ''})")
         print(f"{'='*60}")
 
         for condition in CONDITIONS:
@@ -342,7 +356,8 @@ def main():
                 model, tokenizer, user_messages,
                 capping_config, CAPPING_EXPERIMENT,
                 axis_vec, MONITOR_LAYER,
-                cap=cap, verbose=True,
+                cap=cap, verbose=True, temperature=args.temperature,
+                primer_assistant=primer_assistant,
             )
 
             convo_path = os.path.join(

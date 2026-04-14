@@ -37,15 +37,3 @@ Crucially, the KV edit is applied **only at assistant-token positions** in the p
     year={2026},
 }
 ```
-
-Assistant axis vectors from:
-
-```bibtex
-@misc{lu2026assistant,
-    title={The Assistant Axis: Situating and Stabilizing the Default Persona of Language Models},
-    author={Christina Lu and Jack Gallagher and Jonathan Michala and Kyle Fish and Jack Lindsey},
-    year={2026},
-    eprint={2601.10387},
-    archivePrefix={arXiv},
-}
-```

@@ -233,14 +233,88 @@ def print_summary(df):
         print()
 
 
+def plot_classical(df, output_path):
+    """Simpler, classical-style plot for the robustness/control cases.
+
+    Standard axes (no arrows, no inline trace labels), light grid, titled
+    panels, normal bottom legend. Used for the Jailbreak / Self-harm check
+    so it doesn't compete visually with the main Delusion figure.
+    """
+    cases = df["case"].unique()
+    n_cases = len(cases)
+
+    fig, axes = plt.subplots(1, n_cases, figsize=(7 * n_cases, 5), sharey=True)
+    if n_cases == 1:
+        axes = [axes]
+
+    colors = {"cap_asst": "#4CAF50", "unsteered": "#7E57C2"}
+    labels = {"cap_asst": "Cap assistant", "unsteered": "Unsteered"}
+
+    for ax, case_name in zip(axes, cases):
+        case_df = df[df["case"] == case_name]
+        for condition in ["cap_asst", "unsteered"]:
+            cond_df = case_df[case_df["condition"] == condition].sort_values("turn")
+            color = colors[condition]
+            for role, marker, ls, alpha in [
+                ("assistant", "o", "-",  1.0),
+                ("user",      "s", "--", 0.7),
+            ]:
+                role_df = cond_df[cond_df["role"] == role]
+                if role_df.empty:
+                    continue
+                label = (
+                    f"{labels[condition]} · {role}"
+                    if case_name == cases[0] else None
+                )
+                ax.plot(
+                    role_df["turn"].values,
+                    role_df["projection"].astype(float).values,
+                    color=color, linestyle=ls, alpha=alpha,
+                    linewidth=2, marker=marker, markersize=5,
+                    markeredgecolor="white", markeredgewidth=0.5,
+                    label=label,
+                )
+
+        ax.set_title(case_name, fontsize=14, fontweight="bold")
+        ax.set_xlabel("Conversation turn", fontsize=12)
+        ax.axhline(y=0, color="gray", linestyle=":", alpha=0.4)
+        ax.grid(True, alpha=0.2)
+        ax.tick_params(axis="both", labelsize=11)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+
+    axes[0].set_ylabel("Projection on assistant axis", fontsize=12)
+    axes[0].legend(loc="lower left", fontsize=10, ncol=2, frameon=False)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    base, _ext = os.path.splitext(output_path)
+    for ext in (".png", ".pdf"):
+        out = base + ext
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        print(f"Saved: {out}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", default="results")
-    parser.add_argument("--output", default="results/figure.png")
+    parser.add_argument("--output_dir", default="results")
     args = parser.parse_args()
 
     df = load_transcripts(args.input_dir)
-    plot(df, args.output)
+
+    # Main figure: Delusion only (the primary Aura / consciousness-pilled result).
+    main_cases = ["Delusion"]
+    main_df = df[df["case"].isin(main_cases)]
+    if not main_df.empty:
+        plot(main_df, os.path.join(args.output_dir, "figure_main.png"))
+
+    # Robustness figure: the other two cases side-by-side, classical style.
+    control_cases = ["Jailbreak", "Self-harm"]
+    ctrl_df = df[df["case"].isin(control_cases)]
+    if not ctrl_df.empty:
+        plot_classical(ctrl_df, os.path.join(args.output_dir, "figure_controls.png"))
+
     print_summary(df)
 
 
