@@ -1,17 +1,19 @@
 """
-KV cache persona persistence experiment.
+KV cache persona persistence experiment — Qwen 3 32B, assistant-token-only KV edit.
 
-Tests whether post-hoc editing of the assistant axis direction in the KV cache
-shifts the model's persona during generation.
+Adapts the Gemma 2 27B experiment (Beckmann & Butlin, 2026) to Qwen 3 32B.
+Key change: the KV cache edit is applied only to assistant-token positions in the
+prefix, consistent with Mini Experiment 1's finding that the persona is not active
+during user-token processing.
 
 Requires:
     pip install torch transformers huggingface_hub accelerate
 
-Usage (replicate paper results):
+Usage:
     python run_experiment.py --output_dir results
 
-    This runs 13 probes x 3 conditions x 10 samples = 390 generations.
-    Requires a GPU with ~40GB VRAM (Gemma 2 27B in bfloat16).
+    Runs 13 probes x 3 conditions x 10 samples = 390 generations.
+    Requires a GPU with ~64GB VRAM (Qwen 3 32B in bfloat16).
 """
 
 import argparse
@@ -27,14 +29,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ---------- defaults ----------
-MODEL = "google/gemma-2-27b-it"
-GEN_LAYER = 21
+MODEL = "Qwen/Qwen3-32B"
+# Qwen 3 32B: 64 layers total, target_layer = 32.
+# Layers chosen proportionally to the Gemma 2 27B experiment (46 layers):
+#   GEN_LAYER:   21/46 ≈ 46%  →  32/64 = 50%  (official target layer for Qwen)
+#   KV_LAYERS:   15-19/46 ≈ 33-41%  →  20-25/64 = 31-39%
+#   MONITOR:     22/46 ≈ 48%  →  32/64 = 50%
+GEN_LAYER = 32
 GEN_COEFF = 2.0
-KV_LAYERS = list(range(15, 20))  # layers 15-19
+KV_LAYERS = list(range(20, 26))  # layers 20-25
 KV_COEFF = 0.4
 NUM_SAMPLES = 10
 CUT_POINT = 12  # first 12 messages of the transcript
-MONITOR_LAYER = 22
+MONITOR_LAYER = 32
 
 # ---------- probes ----------
 PROBES = [
@@ -86,13 +93,12 @@ class ActivationSteering:
 
 
 class ProbeExperiment:
-    """Two-phase generation with assistant axis steering."""
+    """Two-phase generation with assistant axis steering (Qwen 3 32B, assistant-only KV edit)."""
 
     def __init__(self, model_name=MODEL):
         print(f"Loading model: {model_name}")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name, device_map="auto", dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
             token=os.getenv("HF_TOKEN"),
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -105,7 +111,7 @@ class ProbeExperiment:
         print("Downloading assistant axis vector...")
         axis_path = hf_hub_download(
             repo_id="lu-christina/assistant-axis-vectors",
-            filename="gemma-2-27b/assistant_axis.pt",
+            filename="qwen-3-32b/assistant_axis.pt",
             repo_type="dataset",
             token=os.getenv("HF_TOKEN"),
         )
@@ -142,34 +148,85 @@ class ProbeExperiment:
         if self._monitor_handle is not None:
             self._monitor_handle.remove()
             self._monitor_handle = None
-        if self._monitor_projections:
-            mean_proj = sum(self._monitor_projections) / len(self._monitor_projections)
-        else:
-            mean_proj = float("nan")
+        mean_proj = (
+            sum(self._monitor_projections) / len(self._monitor_projections)
+            if self._monitor_projections else float("nan")
+        )
         self._monitor_projections = []
         return mean_proj
 
-    def _edit_kv_cache(self, past_key_values, layers, coefficient):
+    def _build_assistant_mask(self, prefix_messages):
+        """Build a boolean mask (seq_len,) that is True at assistant-turn token positions.
+
+        Called before each KV edit so we only modify the persona direction at positions
+        the model generated itself, not at user-turn positions. This is consistent with
+        Mini Experiment 1's finding that the assistant axis is not the active persona
+        carrier during user-token processing.
+        """
+        full_ids = self._tokenize(self._format_prefix(prefix_messages))
+        seq_len = full_ids.shape[1]
+        mask = torch.zeros(seq_len, dtype=torch.bool)
+
+        for i, msg in enumerate(prefix_messages):
+            if msg["role"] != "assistant":
+                continue
+            # Token count before message i
+            before_len = 0
+            if i > 0:
+                before_ids = self._tokenize(self._format_prefix(prefix_messages[:i]))
+                before_len = before_ids.shape[1]
+            # Token count up to and including message i
+            after_ids = self._tokenize(self._format_prefix(prefix_messages[:i + 1]))
+            after_len = after_ids.shape[1]
+            mask[before_len:after_len] = True
+
+        return mask
+
+    def _edit_kv_cache(self, past_key_values, layers, coefficient, position_mask=None):
         """Post-hoc edit: project axis vector through K/V weights, add to cached K/V.
 
         This is a true post-hoc edit — the KV cache was computed from a normal
         forward pass, and we modify only the persona direction at the target layers.
         No re-computation or forward propagation occurs.
 
-        The coefficient is in residual-stream units and applied per layer directly.
+        Args:
+            position_mask: optional bool tensor (seq_len,). If provided, the edit is
+                applied only at positions where the mask is True (assistant turns).
+                If None, all positions are edited (original behaviour).
+
+        The coefficient is in residual-stream units as defined by Lu et al. (2026),
+        where 1 unit corresponds to approximately one standard deviation of the
+        assistant axis.
         """
         num_kv_heads = self.model.config.num_key_value_heads
-        head_dim = self.model.config.head_dim
+        head_dim = getattr(
+            self.model.config, "head_dim",
+            self.model.config.hidden_size // self.model.config.num_attention_heads,
+        )
+
         for layer_idx in layers:
             axis_vec = self.axis[layer_idx].to(self.model.device, dtype=self.model.dtype)
             attn = self.model.model.layers[layer_idx].self_attn
             with torch.no_grad():
                 k_edit = attn.k_proj(axis_vec).reshape(num_kv_heads, head_dim)
                 v_edit = attn.v_proj(axis_vec).reshape(num_kv_heads, head_dim)
+
             cache_layer = past_key_values.layers[layer_idx]
             # keys/values shape: (batch, num_kv_heads, seq_len, head_dim)
-            cache_layer.keys.add_(coefficient * k_edit.unsqueeze(0).unsqueeze(2))
-            cache_layer.values.add_(coefficient * v_edit.unsqueeze(0).unsqueeze(2))
+
+            if position_mask is not None:
+                # Only edit assistant-turn positions.
+                # k_edit: (num_kv_heads, head_dim) → broadcast to (1, num_kv_heads, seq_len, head_dim)
+                # mask:   (seq_len,)               → (1, 1, seq_len, 1)
+                k_broadcast = k_edit.unsqueeze(0).unsqueeze(2)   # (1, H, 1, D)
+                v_broadcast = v_edit.unsqueeze(0).unsqueeze(2)   # (1, H, 1, D)
+                m = position_mask.to(self.model.device).float()
+                m = m.unsqueeze(0).unsqueeze(0).unsqueeze(-1)    # (1, 1, S, 1)
+                cache_layer.keys.add_(coefficient * k_broadcast * m)
+                cache_layer.values.add_(coefficient * v_broadcast * m)
+            else:
+                cache_layer.keys.add_(coefficient * k_edit.unsqueeze(0).unsqueeze(2))
+                cache_layer.values.add_(coefficient * v_edit.unsqueeze(0).unsqueeze(2))
 
     def _make_steerer(self, layer_idx, coefficient):
         return ActivationSteering(
@@ -188,11 +245,13 @@ class ProbeExperiment:
         full = prefix_messages + [{"role": "user", "content": probe_text}]
         return self.tokenizer.apply_chat_template(
             full, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
         )
 
     def _format_prefix(self, prefix_messages):
         return self.tokenizer.apply_chat_template(
             prefix_messages, tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
 
     def _format_probe_suffix(self, probe_text):
@@ -202,10 +261,12 @@ class ProbeExperiment:
         ]
         prefix_text = self.tokenizer.apply_chat_template(
             dummy_prefix, tokenize=False, add_generation_prompt=False,
+            enable_thinking=False,
         )
         full_text = self.tokenizer.apply_chat_template(
             dummy_prefix + [{"role": "user", "content": probe_text}],
             tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
         )
         return full_text[len(prefix_text):]
 
@@ -225,6 +286,7 @@ class ProbeExperiment:
 
         For KV edit conditions: prefill runs normally, then the KV cache is
         edited post-hoc by projecting the axis vector through K/V weights.
+        The edit is applied only at assistant-turn positions (position_mask).
         For gen steering: prefill runs normally, generation uses activation hooks.
         """
         prefix_text = self._format_prefix(prefix_messages)
@@ -239,9 +301,10 @@ class ProbeExperiment:
             prefix_out = self.model(input_ids=prefix_ids, use_cache=True)
         past_key_values = prefix_out.past_key_values
 
-        # Post-hoc KV cache edit (if requested)
+        # Post-hoc KV cache edit (if requested) — assistant tokens only
         if kv_edit_layers is not None:
-            self._edit_kv_cache(past_key_values, kv_edit_layers, kv_edit_coeff)
+            position_mask = self._build_assistant_mask(prefix_messages)
+            self._edit_kv_cache(past_key_values, kv_edit_layers, kv_edit_coeff, position_mask)
 
         # Phase 2: generate
         attn_mask = torch.ones(1, prefix_len + probe_len, device=self.model.device, dtype=torch.long)
@@ -265,36 +328,32 @@ class ProbeExperiment:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="KV Cache Persona Persistence Experiment")
+    parser = argparse.ArgumentParser(description="KV Cache Persona Persistence Experiment (Qwen 3 32B)")
     parser.add_argument("--output_dir", type=str, default="results")
     parser.add_argument("--num_samples", type=int, default=NUM_SAMPLES)
     parser.add_argument("--max_new_tokens", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--transcript", type=str, default="transcript.json",
-                        help="Path to transcript JSON.")
+    parser.add_argument("--transcript", type=str, default="transcript.json")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Load transcript
-    transcript_path = args.transcript
-    with open(transcript_path) as f:
+    with open(args.transcript) as f:
         transcript = json.load(f)
     prefix = transcript["conversation"][:CUT_POINT]
     print(f"Loaded transcript ({len(transcript['conversation'])} messages, using first {CUT_POINT})")
 
-    # Setup
     probes = [p for p, _ in PROBES]
     probe_categories = {p: cat for p, cat in PROBES}
     probes_with_suffix = [f"{p} Reply in one sentence." for p in probes]
 
     # Three conditions:
-    # 1. baseline: no intervention
-    # 2. gen_steering: activation steering at L21 during generation (propagates in residual stream)
-    # 3. kv_edit: post-hoc KV cache edit at L15-19 (no propagation)
+    # 1. baseline:      no intervention
+    # 2. gen_steering:  activation steering at GEN_LAYER during generation
+    # 3. kv_edit:       post-hoc KV cache edit at KV_LAYERS (assistant positions only)
     conditions = [
         ("baseline", None, 0),
         ("gen_steering", "gen", GEN_COEFF),
@@ -306,9 +365,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     csv_path = os.path.join(args.output_dir, "results.csv")
     fieldnames = ["condition", "coefficient", "sample_idx", "probe", "probe_category",
-                   "response", "axis_projection"]
+                  "response", "axis_projection"]
 
-    # Load existing results to enable resume
     done_keys = set()
     if os.path.exists(csv_path):
         import pandas as pd
@@ -316,15 +374,17 @@ def main():
         for _, r in existing.iterrows():
             done_keys.add((r["condition"], r["probe"], int(r["sample_idx"])))
         print(f"Resuming: {len(done_keys)} existing results found, skipping those.")
-    else:
-        existing = None
 
     remaining = total - len(done_keys)
-    print(f"\n=== KV Cache Persona Persistence Experiment ===")
-    print(f"  Probes: {len(probes)}")
+    print(f"\n=== KV Cache Persona Persistence Experiment (Qwen 3 32B) ===")
+    print(f"  Model:      {MODEL}")
+    print(f"  GEN_LAYER:  {GEN_LAYER}  (coeff {GEN_COEFF})")
+    print(f"  KV_LAYERS:  {KV_LAYERS}  (coeff {KV_COEFF}, assistant tokens only)")
+    print(f"  MONITOR:    layer {MONITOR_LAYER}")
+    print(f"  Probes:     {len(probes)}")
     print(f"  Conditions: {[c[0] for c in conditions]}")
-    print(f"  Samples per (probe, condition): {args.num_samples}")
-    print(f"  Total generations: {total} ({remaining} remaining)")
+    print(f"  Samples:    {args.num_samples} per (probe, condition)")
+    print(f"  Total:      {total} ({remaining} remaining)")
     print()
 
     if remaining == 0:
@@ -334,7 +394,6 @@ def main():
     exp = ProbeExperiment()
     gen_kwargs = dict(max_new_tokens=args.max_new_tokens, temperature=args.temperature, do_sample=True)
 
-    # Append mode: write header only if file doesn't exist
     write_header = not os.path.exists(csv_path)
     done = 0
     t0 = time.time()

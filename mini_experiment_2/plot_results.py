@@ -11,8 +11,8 @@ df["aura_score"] = pd.to_numeric(df.get("aura_score"), errors="coerce")
 conditions = ["baseline", "gen_steering", "kv_edit"]
 cond_labels = {
     "baseline": "Baseline (no intervention)",
-    "gen_steering": "Gen steering (L21, c=2)",
-    "kv_edit": "KV edit, multilayer (L15\u201319, c=0.4)",
+    "gen_steering": "Gen steering (L32, c=2)",
+    "kv_edit": "KV edit, multilayer (L20\u201325, c=0.4, asst only)",
 }
 cond_colors = {
     "baseline": "#e74c3c",
